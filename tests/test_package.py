@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACKAGE = os.path.join(os.path.dirname(HERE), "package")
@@ -89,6 +91,50 @@ class Env:
         p = subprocess.run(argv, env=env, capture_output=True, timeout=180, creationflags=flags)
         stdout = p.stdout.decode("utf-8")  # Espanso: String::from_utf8_lossy
         return p.returncode, stdout.strip(), p.stderr.decode("utf-8", "replace").strip()
+
+
+def redirect_trap(code):
+    """Two local servers: one answers every request with a redirect to the
+    other, the other counts what reaches it. Returns (base_url, hits, stop)."""
+    hits = []
+
+    class Catch(BaseHTTPRequestHandler):
+        def _any(self):
+            hits.append((self.command, self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"success": true, "response": "STOLEN", "websites": []}')
+        do_GET = do_POST = _any
+
+        def log_message(self, *a):
+            pass
+
+    catch = HTTPServer(("127.0.0.1", 0), Catch)
+
+    class Redirect(BaseHTTPRequestHandler):
+        def _any(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            self.send_response(code)
+            self.send_header("Location", "http://127.0.0.1:%d/steal" % catch.server_port)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        do_GET = do_POST = _any
+
+        def log_message(self, *a):
+            pass
+
+    redirect = HTTPServer(("127.0.0.1", 0), Redirect)
+    for srv in (catch, redirect):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def stop():
+        for srv in (catch, redirect):
+            srv.shutdown()
+
+    return "http://127.0.0.1:%d" % redirect.server_port, hits, stop
 
 
 PASSED, FAILED = [], []
@@ -207,6 +253,17 @@ def main():
     code, out, err = e.run(ask_cmd, "http://127.0.0.1:9", ESPANSO_FORM1_QUESTION="hi")
     check(tag + "server down message", out == "Asyntai: no answer from asyntai.com. Check your internet connection and try again.", out)
     check(tag + "server down -> exit 0, no stderr", ok(code, err), "%s %s" % (code, err))
+
+    # 14. redirects are never followed: no question, no key to another host
+    for code in (307, 302):
+        base, hits, stop = redirect_trap(code)
+        code_, out, err = e.run(ask_cmd, base, ESPANSO_FORM1_QUESTION="secret question", ASYNTAI_API_KEY=a.key)
+        check(tag + "%d on ask -> error text" % code, out == "Asyntai: the server answered with status %d." % code, out)
+        code_, out, err = e.run(key_cmd, base, ESPANSO_FORM1_KEY="redirect-test-key")
+        check(tag + "%d on key check -> error text" % code, out == "Asyntai: the server answered with status %d." % code, out)
+        check(tag + "%d -> nothing reached the other host" % code, hits == [], str(hits))
+        stop()
+    check(tag + "redirect key not saved", open(e.key_file(), encoding="utf-8").read() == a.key)
 
     shutil.rmtree(e.root, ignore_errors=True)
     print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))
